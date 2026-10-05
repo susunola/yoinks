@@ -16,6 +16,8 @@ import {formatBytes, formatDuration, formatEta, formatSpeed, shortenPath, trunca
 import {addToHistory, loadHistory} from './lib/history.js'
 import {detectPlatform, isProbablyUrl, type Platform} from './lib/platforms.js'
 import {useMouseClick} from './lib/use-mouse-click.js'
+import {parseTelegramLink} from './lib/telegram-url.js'
+import {acceptTelegramInvite, downloadTelegram, hasTelegramSession, telegramLoginHint} from './lib/telegram.js'
 import {nextThemeMode, ThemeProvider, type ThemeMode, useTheme} from './theme.js'
 import {
   buildChoices,
@@ -175,9 +177,58 @@ function AppContent({
   const boxWidth = Math.max(14, Math.min(64, columns - 6))
   const contentWidth = Math.max(10, Math.min(columns - 4, 78))
 
+  const runTelegram = useCallback(
+    async (
+      targetUrl: string,
+      link: NonNullable<ReturnType<typeof parseTelegramLink>>,
+      controller: AbortController,
+    ) => {
+      setPlatform({key: 'telegram', label: 'Telegram'})
+      if (!(await hasTelegramSession())) {
+        setPhase({name: 'error', message: telegramLoginHint()})
+        return
+      }
+      if (link.kind === 'invite') {
+        setPhase({name: 'probing', status: 'opening invite…'})
+        try {
+          const hint = await acceptTelegramInvite(link.hash, controller.signal)
+          if (controller.signal.aborted) return
+          setPhase({name: 'error', message: hint})
+        } catch (error) {
+          if (controller.signal.aborted) return
+          setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+        }
+        return
+      }
+      const choice: DownloadChoice = {kind: 'video', label: 'original file', args: []}
+      setPhase({name: 'downloading', choice, processing: false})
+      try {
+        const filepath = await downloadTelegram(
+          link,
+          OUT_DIR,
+          progress => setPhase(prev => (prev.name === 'downloading' ? {...prev, progress, processing: false} : prev)),
+          controller.signal,
+        )
+        if (controller.signal.aborted) return
+        onOutcome({filepath})
+        setHistory(addToHistory(targetUrl))
+        setPhase({name: 'done', filepath})
+      } catch (error) {
+        if (controller.signal.aborted) return
+        setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+      }
+    },
+    [onOutcome],
+  )
+
   const startProbe = useCallback(async (targetUrl: string) => {
     const controller = new AbortController()
     abortRef.current = controller
+    const telegramLink = parseTelegramLink(targetUrl)
+    if (telegramLink && telegramLink.kind !== 'public-message') {
+      await runTelegram(targetUrl, telegramLink, controller)
+      return
+    }
     setPlatform(detectPlatform(targetUrl))
     setPhase({name: 'probing', status: 'warming up…'})
     try {
@@ -196,9 +247,15 @@ function AppContent({
       setPhase({name: 'picking'})
     } catch (error) {
       if (controller.signal.aborted) return
-      setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+      if (telegramLink && (await hasTelegramSession())) {
+        await runTelegram(targetUrl, telegramLink, controller)
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      const hint = telegramLink ? ` ${telegramLoginHint()}` : ''
+      setPhase({name: 'error', message: `${message}${hint}`})
     }
-  }, [])
+  }, [runTelegram])
 
   useEffect(() => {
     if (initialUrl) void startProbe(initialUrl)

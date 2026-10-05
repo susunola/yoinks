@@ -3,13 +3,15 @@ import {isThemeMode, type ThemeMode} from '../theme.js'
 export type CliArgs = {
   help: boolean
   version: boolean
+  telegramLogin: boolean
+  telegramLogout: boolean
   initialUrl?: string
   themeMode?: ThemeMode
   error?: string
 }
 
 export function parseArgs(args: string[]): CliArgs {
-  const result: CliArgs = {help: false, version: false}
+  const result: CliArgs = {help: false, version: false, telegramLogin: false, telegramLogout: false}
   const positional: string[] = []
 
   for (let index = 0; index < args.length; index++) {
@@ -27,6 +29,10 @@ export function parseArgs(args: string[]): CliArgs {
       const value = arg.slice('--theme='.length)
       if (!isThemeMode(value)) return {...result, error: `unknown theme “${value}” — use auto, light, or dark`}
       result.themeMode = value
+    } else if (arg === '--telegram-login') {
+      result.telegramLogin = true
+    } else if (arg === '--telegram-logout') {
+      result.telegramLogout = true
     } else if (arg.startsWith('-')) {
       return {...result, error: `unknown option “${arg}”`}
     } else {

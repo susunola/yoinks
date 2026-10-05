@@ -61,6 +61,12 @@ click the theme control in the footer to cycle through `auto`, `light`, and
   on your PATH, with `ffmpeg-static` as a bundled fallback.
 - The UI is [Ink](https://github.com/vadimdemedes/ink) — React for the
   terminal.
+- Public `t.me/<channel>/<id>` posts go through yt-dlp. Private channel
+  links (`t.me/c/…`) and invite links need your own Telegram login:
+  `yoinks --telegram-login` (api_id / api_hash from
+  [my.telegram.org](https://my.telegram.org)). The session is stored in
+  `~/.yoinks` and can only open chats that account already belongs to.
+  `yoinks --telegram-logout` deletes it.
 
 ## Development
 
@@ -81,6 +87,7 @@ To try it as a global command without publishing: `npm link`, then run
 - [ ] `-o <dir>` to choose the output folder
 - [ ] Playlist / thread-with-multiple-videos support
 - [ ] Clipboard detection: launch bare and auto-suggest the url you copied
+- [x] Private Telegram posts via a saved user session (`yoinks --telegram-login`)
 - [ ] Self-update for the bundled yt-dlp binary (`yt-dlp -U`)
 - [x] Publish to npm (`npm i -g yoinks` / `npx yoinks`)
 - [ ] `curl yoinks.sh | sh` installer
