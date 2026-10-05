@@ -13,6 +13,7 @@ const PLATFORMS: Array<{hosts: string[]; platform: Platform}> = [
   {hosts: ['twitch.tv'], platform: {key: 'twitch', label: 'Twitch'}},
   {hosts: ['reddit.com'], platform: {key: 'reddit', label: 'Reddit'}},
   {hosts: ['facebook.com', 'fb.watch'], platform: {key: 'facebook', label: 'Facebook'}},
+  {hosts: ['t.me', 'telegram.me', 'telegram.dog'], platform: {key: 'telegram', label: 'Telegram'}},
 ]
 
 export function detectPlatform(url: string): Platform {

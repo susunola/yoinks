@@ -7,6 +7,8 @@ test('parses a url and a spaced theme option without confusing the value for the
   assert.deepEqual(parseArgs(['--theme', 'light', 'https://example.com/video']), {
     help: false,
     version: false,
+    telegramLogin: false,
+    telegramLogout: false,
     themeMode: 'light',
     initialUrl: 'https://example.com/video',
   })
@@ -16,6 +18,8 @@ test('parses an equals-style theme option after the url', () => {
   assert.deepEqual(parseArgs(['https://example.com/video', '--theme=dark']), {
     help: false,
     version: false,
+    telegramLogin: false,
+    telegramLogout: false,
     themeMode: 'dark',
     initialUrl: 'https://example.com/video',
   })

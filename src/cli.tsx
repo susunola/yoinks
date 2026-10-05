@@ -6,6 +6,7 @@ import {captureFrames} from './lib/click-map.js'
 import {parseArgs} from './lib/args.js'
 import {readClipboard} from './lib/clipboard.js'
 import {isProbablyUrl} from './lib/platforms.js'
+import {loginTelegram, logoutTelegram} from './lib/telegram.js'
 
 // read at runtime from the shipped package.json so npm version bumps
 // can't drift from a hardcoded constant
@@ -24,6 +25,8 @@ const HELP = `
 
   Options
     --theme <mode>  use auto, light, or dark for this run
+    --telegram-login   sign in once for private t.me links
+    --telegram-logout  forget the saved Telegram session
     -h, --help      show this help
     -v, --version   show version
 
@@ -45,6 +48,22 @@ if (args.help) {
 
 if (args.version) {
   console.log(VERSION)
+  process.exit(0)
+}
+
+if (args.telegramLogout) {
+  await logoutTelegram()
+  console.log('forgot the Telegram session')
+  process.exit(0)
+}
+
+if (args.telegramLogin) {
+  try {
+    await loginTelegram()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error)
+    process.exit(1)
+  }
   process.exit(0)
 }
 
