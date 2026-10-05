@@ -24,7 +24,9 @@ import {
   download,
   ensureYtDlp,
   findFfmpeg,
+  forgetInfoJson,
   probe,
+  shouldRetryWithoutInfo,
   type DownloadChoice,
   type DownloadProgress,
   type VideoInfo,
@@ -99,6 +101,7 @@ type Phase =
       refreshing?: boolean
     }
   | {name: 'done'; filepath: string}
+  | {name: 'notice'; message: string}
   | {name: 'error'; message: string}
 
 const HINTS: Record<Phase['name'], Array<[string, string]>> = {
@@ -121,6 +124,10 @@ const HINTS: Record<Phase['name'], Array<[string, string]>> = {
     ['^c', 'quit'],
   ],
   done: [['^c', 'quit']],
+  notice: [
+    ['↵', 'back'],
+    ['^c', 'quit'],
+  ],
   error: [
     ['↵', 'try again'],
     ['^c', 'quit'],
@@ -170,6 +177,7 @@ function AppContent({
   const ytdlpRef = useRef('')
   const highlightRef = useRef(0) // choice under the cursor, for the ↵ hint click
   const infoJsonRef = useRef<string | undefined>(undefined)
+  const ffmpegRef = useRef<Promise<string | undefined>>(findFfmpeg())
   const abortRef = useRef<AbortController | undefined>(undefined)
   const [phase, setPhase] = useState<Phase>(initialUrl ? {name: 'probing', status: 'warming up…'} : {name: 'input'})
 
@@ -193,7 +201,7 @@ function AppContent({
         try {
           const hint = await acceptTelegramInvite(link.hash, controller.signal)
           if (controller.signal.aborted) return
-          setPhase({name: 'error', message: hint})
+          setPhase({name: 'notice', message: hint})
         } catch (error) {
           if (controller.signal.aborted) return
           setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
@@ -238,7 +246,11 @@ function AppContent({
       ytdlpRef.current = ytdlp
       if (controller.signal.aborted) return
       setPhase({name: 'probing', status: 'fetching video info…'})
-      const {info: videoInfo, infoJsonPath} = await probe(ytdlp, targetUrl, controller.signal)
+      ffmpegRef.current = findFfmpeg()
+      const [{info: videoInfo, infoJsonPath}] = await Promise.all([
+        probe(ytdlp, targetUrl, controller.signal),
+        ffmpegRef.current,
+      ])
       if (controller.signal.aborted) return
       infoJsonRef.current = infoJsonPath
       setInfo(videoInfo)
@@ -272,6 +284,9 @@ function AppContent({
 
   const cancelRun = useCallback(() => {
     abortRef.current?.abort()
+    const infoJsonPath = infoJsonRef.current
+    infoJsonRef.current = undefined
+    void forgetInfoJson(infoJsonPath)
     resetToInput()
     setUrlInput(url) // keep the link around so a cancel isn't destructive
   }, [resetToInput, url])
@@ -282,9 +297,9 @@ function AppContent({
         cycleTheme()
         return
       }
-      if (key.escape && (phase.name === 'picking' || phase.name === 'error' || phase.name === 'done')) resetToInput()
+      if (key.escape && (phase.name === 'picking' || phase.name === 'error' || phase.name === 'done' || phase.name === 'notice')) resetToInput()
       if (key.escape && (phase.name === 'probing' || phase.name === 'downloading')) cancelRun()
-      if (key.return && (phase.name === 'error' || phase.name === 'done')) resetToInput()
+      if (key.return && (phase.name === 'error' || phase.name === 'done' || phase.name === 'notice')) resetToInput()
     },
     {isActive: Boolean(process.stdin.isTTY)},
   )
@@ -315,14 +330,15 @@ function AppContent({
           setPhase(prev => (prev.name === 'downloading' ? {...prev, processing: true} : prev)),
       }
       try {
-        const ffmpegLocation = await findFfmpeg()
+        const ffmpegLocation = await ffmpegRef.current
         const base = {ytdlp: ytdlpRef.current, ffmpegLocation, url, choice, outDir: OUT_DIR}
+        const infoJsonPath = infoJsonRef.current
         let filepath: string
         try {
           // reuse the probe's metadata — starts immediately instead of re-extracting
-          filepath = await download({...base, infoJsonPath: infoJsonRef.current}, handlers, controller.signal)
+          filepath = await download({...base, infoJsonPath}, handlers, controller.signal)
         } catch (error) {
-          if (controller.signal.aborted) throw error
+          if (controller.signal.aborted || !infoJsonPath || !shouldRetryWithoutInfo(error)) throw error
           // media urls in the cached info can expire — retry with a fresh extraction
           setPhase(prev =>
             prev.name === 'downloading' ? {...prev, progress: undefined, refreshing: true} : prev,
@@ -335,6 +351,10 @@ function AppContent({
       } catch (error) {
         if (controller.signal.aborted) return
         setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+      } finally {
+        const infoJsonPath = infoJsonRef.current
+        infoJsonRef.current = undefined
+        void forgetInfoJson(infoJsonPath)
       }
     })()
   }
@@ -354,7 +374,7 @@ function AppContent({
     if (key === '↵') {
       if (phase.name === 'input') return () => handleUrlSubmit(urlInput)
       if (phase.name === 'picking') return () => handlePick({value: highlightRef.current})
-      if (phase.name === 'error' || phase.name === 'done') return resetToInput
+      if (phase.name === 'error' || phase.name === 'done' || phase.name === 'notice') return resetToInput
     }
     return undefined // ↑↓ / ↑ stay keyboard-only
   }
@@ -538,6 +558,12 @@ function AppContent({
           >
             <Text bold color={theme.primary}>{DONE_LABEL}</Text>
           </Box>
+        </Box>
+      )}
+
+      {phase.name === 'notice' && (
+        <Box flexDirection="column" alignItems="center" width={Math.max(10, Math.min(columns - 6, 72))}>
+          <Text color={theme.primary}>{phase.message}</Text>
         </Box>
       )}
 
