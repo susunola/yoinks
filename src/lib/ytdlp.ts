@@ -40,7 +40,10 @@ export async function ensureYtDlp(onStatus: (message: string) => void, signal?: 
   if (await commandWorks('yt-dlp', ['--version'])) return 'yt-dlp'
 
   const local = path.join(YOINKS_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
-  if (await commandWorks(local, ['--version'])) return local
+  if (await commandWorks(local, ['--version'])) {
+    refreshYtDlp(local)
+    return local
+  }
 
   onStatus('first run: fetching yt-dlp…')
   await fs.mkdir(YOINKS_DIR, {recursive: true})
@@ -58,12 +61,19 @@ export async function ensureYtDlp(onStatus: (message: string) => void, signal?: 
   return local
 }
 
+let ffmpegLookup: Promise<string | undefined> | undefined
+
 /**
  * Find ffmpeg for stream merging / mp3 extraction: system install first,
  * ffmpeg-static as fallback. Returns undefined if neither exists — yt-dlp
- * still works for single-file formats without it.
+ * still works for single-file formats without it. Cached for the process.
  */
-export async function findFfmpeg(): Promise<string | undefined> {
+export function findFfmpeg(): Promise<string | undefined> {
+  ffmpegLookup ??= locateFfmpeg()
+  return ffmpegLookup
+}
+
+async function locateFfmpeg(): Promise<string | undefined> {
   if (await commandWorks('ffmpeg', ['-version'])) return undefined // on PATH, yt-dlp finds it itself
   try {
     const mod = await import('ffmpeg-static')
@@ -73,6 +83,35 @@ export async function findFfmpeg(): Promise<string | undefined> {
     // ffmpeg-static not installed or unsupported platform
   }
   return undefined
+}
+
+const STALE_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Refresh a managed binary in the background once it is a week old. Never blocks a download. */
+export function refreshYtDlp(binary: string): void {
+  if (binary === 'yt-dlp') return
+  void (async () => {
+    try {
+      const stat = await fs.stat(binary)
+      if (Date.now() - stat.mtimeMs < STALE_MS) return
+      const child = spawn(binary, ['-U'], {stdio: 'ignore'})
+      child.on('close', code => {
+        if (code === 0) void fs.utimes(binary, new Date(), new Date()).catch(() => undefined)
+      })
+    } catch {
+      // a missing binary is ensureYtDlp's problem, not the background refresh
+    }
+  })()
+}
+
+export async function forgetInfoJson(infoJsonPath?: string): Promise<void> {
+  if (!infoJsonPath) return
+  await fs.rm(infoJsonPath, {force: true}).catch(() => undefined)
+}
+
+export function shouldRetryWithoutInfo(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /expired|403|401|unable to download|http error|fragment|signature/i.test(message)
 }
 
 export type VideoInfo = {
@@ -106,16 +145,16 @@ export type ProbeResult = {
 export async function probe(ytdlp: string, url: string, signal?: AbortSignal): Promise<ProbeResult> {
   const stdout = await new Promise<string>((resolve, reject) => {
     const child = spawn(ytdlp, ['-J', '--no-playlist', '--no-warnings', url], {signal})
-    let out = ''
-    let stderr = ''
-    child.stdout.on('data', chunk => (out += chunk))
-    child.stderr.on('data', chunk => (stderr += chunk))
+    const chunks: Buffer[] = []
+    const errors: Buffer[] = []
+    child.stdout.on('data', chunk => chunks.push(chunk))
+    child.stderr.on('data', chunk => errors.push(chunk))
     child.on('error', reject)
     child.on('close', code => {
       if (code !== 0) {
-        reject(new Error(cleanYtDlpError(stderr) || `yt-dlp exited with code ${code}`))
+        reject(new Error(cleanYtDlpError(Buffer.concat(errors).toString()) || `yt-dlp exited with code ${code}`))
       } else {
-        resolve(out)
+        resolve(Buffer.concat(chunks).toString())
       }
     })
   })
@@ -157,15 +196,12 @@ export function buildChoices(info: VideoInfo): DownloadChoice[] {
     const muxed = best.acodec && best.acodec !== 'none'
     const size = (best.filesize ?? best.filesize_approx ?? 0) + (muxed ? 0 : audioSize ?? 0)
     const sizeLabel = size > 0 ? ` · ~${formatBytes(size)}` : ''
+    const audioId = bestAudio?.format_id
+    const format = muxed || !audioId ? best.format_id : `${best.format_id}+${audioId}/${best.format_id}`
     choices.push({
       kind: 'video',
       label: `${height}p · mp4${sizeLabel}`,
-      args: [
-        '-f',
-        `bv*[height=${height}]+ba/b[height=${height}]/bv*[height<=${height}]+ba/b`,
-        '--merge-output-format',
-        'mp4',
-      ],
+      args: ['-f', format, '--merge-output-format', 'mp4'],
     })
   }
 
@@ -213,7 +249,22 @@ const PROGRESS_PREFIX = 'YOINK|'
 const PROGRESS_TEMPLATE = `${PROGRESS_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s`
 
 let activeChild: ChildProcess | undefined
-process.on('exit', () => activeChild?.kill('SIGTERM'))
+
+function killActive(): void {
+  const child = activeChild
+  if (!child?.pid) return
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-child.pid, 'SIGTERM')
+      return
+    } catch {
+      // not a process-group leader — fall through
+    }
+  }
+  child.kill('SIGTERM')
+}
+
+process.on('exit', killActive)
 
 export function download(
   opts: {
@@ -243,76 +294,91 @@ export function download(
     '--print',
     'after_move:filepath',
     '--no-simulate',
+    '--concurrent-fragments',
+    '8',
     '-o',
-    path.join(opts.outDir, '%(title).60s.%(ext)s'),
+    path.join(opts.outDir, '%(title).60s [%(id)s].%(ext)s'),
   ]
   if (opts.ffmpegLocation) args.push('--ffmpeg-location', opts.ffmpegLocation)
 
   return new Promise((resolve, reject) => {
-    const child = spawn(opts.ytdlp, args, {signal})
-    activeChild = child
+    void fs.mkdir(opts.outDir, {recursive: true}).then(
+      () => {
+        const child = spawn(opts.ytdlp, args, {signal, detached: process.platform !== 'win32'})
+        activeChild = child
+        const onAbort = () => killActive()
+        signal?.addEventListener('abort', onAbort, {once: true})
 
-    let stderr = ''
-    let filepath = ''
-    let part = 0
-    let totalParts = 1
-    let lastDownloaded = 0
-    let buffer = ''
-    // every file yt-dlp writes this run, so a cancel can clean up after itself
-    const destinations: string[] = []
+        let stderr = ''
+        let filepath = ''
+        let part = 0
+        let totalParts = 1
+        let lastDownloaded = 0
+        let lastEmit = 0
+        let buffer = ''
+        // every file yt-dlp writes this run, so a cancel can clean up after itself
+        const destinations: string[] = []
 
-    child.stdout.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString()
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
-      for (const rawLine of lines) {
-        const line = rawLine.trim()
-        if (!line) continue
-        if (line.startsWith(PROGRESS_PREFIX)) {
-          const [downloaded, total, totalEstimate, speed, eta] = line.slice(PROGRESS_PREFIX.length).split('|')
-          const downloadedBytes = toNumber(downloaded) ?? 0
-          if (downloadedBytes < lastDownloaded) part++
-          lastDownloaded = downloadedBytes
-          handlers.onProgress({
-            downloadedBytes,
-            totalBytes: toNumber(total) ?? toNumber(totalEstimate),
-            speed: toNumber(speed),
-            eta: toNumber(eta),
-            part,
-            totalParts,
-          })
-        } else if (line.includes('Downloading 1 format(s):')) {
-          // "[info] xxx: Downloading 1 format(s): 395+251" — each id is one file
-          totalParts = (line.split('format(s):')[1] ?? '').trim().split('+').length
-        } else if (line.includes('[Merger]') || line.includes('[ExtractAudio]')) {
-          const merging = /^\[Merger\] Merging formats into "(.+)"$/.exec(line)?.[1]
-          const extracting = /^\[ExtractAudio\] Destination: (.+)$/.exec(line)?.[1]
-          const target = merging ?? extracting
-          if (target) destinations.push(target)
-          handlers.onProcessing()
-        } else if (line.startsWith('[download] Destination: ')) {
-          destinations.push(line.slice('[download] Destination: '.length))
-        } else if (path.isAbsolute(line)) {
-          filepath = line
-        }
-      }
-    })
-    child.stderr.on('data', chunk => (stderr += chunk))
-    child.on('error', reject)
-    child.on('close', code => {
-      activeChild = undefined
-      if (signal?.aborted) {
-        // cancelled on purpose — don't leave half-written files behind
-        void removePartials(destinations)
-        reject(new Error('Download cancelled.'))
-        return
-      }
-      if (code === 0 && filepath) {
-        resolve(filepath)
-      } else {
-        reject(new Error(cleanYtDlpError(stderr) || `Download failed (yt-dlp exit code ${code}).`))
-      }
-    })
+        child.stdout.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString()
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? ''
+          for (const rawLine of lines) {
+            const line = rawLine.trim()
+            if (!line) continue
+            if (line.startsWith(PROGRESS_PREFIX)) {
+              const [downloaded, total, totalEstimate, speed, eta] = line.slice(PROGRESS_PREFIX.length).split('|')
+              const downloadedBytes = toNumber(downloaded) ?? 0
+              if (downloadedBytes < lastDownloaded) part++
+              lastDownloaded = downloadedBytes
+              const now = Date.now()
+              const totalBytes = toNumber(total) ?? toNumber(totalEstimate)
+              if (now - lastEmit < 150 && downloadedBytes !== totalBytes) continue
+              lastEmit = now
+              handlers.onProgress({
+                downloadedBytes,
+                totalBytes,
+                speed: toNumber(speed),
+                eta: toNumber(eta),
+                part,
+                totalParts,
+              })
+            } else if (line.includes('Downloading 1 format(s):')) {
+              // "[info] xxx: Downloading 1 format(s): 395+251" — each id is one file
+              totalParts = (line.split('format(s):')[1] ?? '').trim().split('+').length
+            } else if (line.includes('[Merger]') || line.includes('[ExtractAudio]')) {
+              const merging = /^\[Merger\] Merging formats into "(.+)"$/.exec(line)?.[1]
+              const extracting = /^\[ExtractAudio\] Destination: (.+)$/.exec(line)?.[1]
+              const target = merging ?? extracting
+              if (target) destinations.push(target)
+              handlers.onProcessing()
+            } else if (line.startsWith('[download] Destination: ')) {
+              destinations.push(line.slice('[download] Destination: '.length))
+            } else if (path.isAbsolute(line)) {
+              filepath = line
+            }
+          }
+        })
+        child.stderr.on('data', chunk => (stderr += chunk))
+        child.on('error', reject)
+        child.on('close', code => {
+          activeChild = undefined
+          signal?.removeEventListener('abort', onAbort)
+          if (signal?.aborted) {
+            // cancelled on purpose — don't leave half-written files behind
+            void removePartials(destinations)
+            reject(new Error('Download cancelled.'))
+            return
+          }
+          if (code === 0 && filepath) {
+            resolve(filepath)
+          } else {
+            reject(new Error(cleanYtDlpError(stderr) || `Download failed (yt-dlp exit code ${code}).`))
+          }
+        })
+      },
+      reject,
+    )
   })
 }
 
